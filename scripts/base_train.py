@@ -25,6 +25,14 @@ import wandb
 import torch
 import torch.distributed as dist
 
+try:
+    # Records run intent and per-step progress to Warpscale. Inert unless launched
+    # under `warpscale run`, so it is safe to call unconditionally.
+    import warpscale
+    has_warpscale = True
+except ImportError:
+    has_warpscale = False
+
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
@@ -356,6 +364,23 @@ print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
+# Warpscale run intent. Must follow compute_init (the SDK elects rank 0 as sole
+# emitter and needs the process group up), and total_steps is only known here.
+if has_warpscale:
+    # fp8 must be reported when set: the peak-FLOPS table is keyed on precision,
+    # so reporting bf16 for an fp8 run selects the wrong roofline.
+    fp8_active = args.fp8 and device_type == "cuda"  # --fp8 is ignored off cuda
+    warpscale_precision = "fp8" if fp8_active else {torch.bfloat16: "bf16", torch.float16: "fp16"}.get(COMPUTE_DTYPE, "fp32")
+    warpscale.init(
+        total_steps=num_iterations,
+        tokens_per_step=total_batch_size,
+        precision=warpscale_precision,
+        framework="nanochat",
+        param_count=num_params,
+        flops_per_token=num_flops_per_token,
+        start_step=args.resume_from_step if resuming else 0,
+    )
+
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):
     warmup_iters = args.warmup_steps
@@ -411,6 +436,8 @@ grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+
+warpscale_last_epoch = -1
 
 # Go!
 while True:
@@ -475,6 +502,8 @@ while True:
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        if has_warpscale:
+            warpscale.checkpoint_started()
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -497,6 +526,8 @@ while True:
             },
             rank=ddp_rank,
         )
+        if has_warpscale:
+            warpscale.checkpoint_persisted()
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
@@ -582,6 +613,13 @@ while True:
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
     step += 1
+    if has_warpscale:
+        warpscale.step(step)
+        # The dataloader's dataset-pass counter is the only epoch nanochat has.
+        data_epoch = dataloader_state_dict["epoch"]
+        if data_epoch != warpscale_last_epoch:
+            warpscale.epoch(data_epoch)
+            warpscale_last_epoch = data_epoch
 
     # The garbage collector is sadly a little bit overactive and for some poorly understood reason,
     # it spends ~500ms scanning for cycles quite frequently, just to end up cleaning up very few tiny objects each time.
