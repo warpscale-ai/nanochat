@@ -1,11 +1,14 @@
 #!/bin/bash
-# Runs base_train on the local SLURM box in one of two modes: `baseline` launches
-# plain torchrun, `profiled` wraps it in `warpscale run` so the shim injects
-# libwarpscale and the pyhook. Sized for a short run, not for the speedrun.
 #
-# One-time prep — data shards and tokenizer, both CPU-only:
+# One-time prep, CPU-only. Short runs:
 #   python -m nanochat.dataset -n 1
 #   python -m scripts.tok_train --max-chars=200000000
+# Full speedrun — the tokenizer must see the full 2B chars or val_bpb and CORE
+# shift, so train it on 8 shards while the rest download:
+#   python -m nanochat.dataset -n 8
+#   python -m nanochat.dataset -n 170 &   # then `wait` before training — d24 at
+#   python -m scripts.tok_train           # ratio 8 consumes ~150 shards
+#   python -m scripts.tok_eval            # compression ratio; informational
 #
 #   runs/warpscale_base_train.sh baseline
 #   runs/warpscale_base_train.sh profiled
@@ -19,8 +22,6 @@ case "$MODE" in
 esac
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-2}"
-PARTITION="${PARTITION:-gpu}"
-CPUS_PER_TASK="${CPUS_PER_TASK:-8}"
 EXPERIMENT="${EXPERIMENT:-nanochat}"
 
 # Short-run sizing for the 2x L4 dev box. fp8 stays off: nanochat documents it H100+.
@@ -57,15 +58,13 @@ TRAIN_ARGS=(
     --model-tag="warpscale-$MODE"
     "$@"
 )
-SRUN=(srun --nodes=1 --ntasks=1 --gres=gpu:"$NPROC_PER_NODE" --cpus-per-task="$CPUS_PER_TASK"
-      --partition="$PARTITION" --job-name="nanochat-$MODE" --export=ALL)
 TORCHRUN=(.venv/bin/torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.base_train --)
 
 if [[ "$MODE" == baseline ]]; then
-    WS_RUN_TYPE=baseline "${SRUN[@]}" "${TORCHRUN[@]}" "${TRAIN_ARGS[@]}"
+    WS_RUN_TYPE=baseline "${TORCHRUN[@]}" "${TRAIN_ARGS[@]}"
 else
     [[ -x "$WARPSCALE_BIN" ]] || { echo "error: warpscale shim not at $WARPSCALE_BIN — build it in $WARPSCALE_REPO" >&2; exit 1; }
     WS_RUN_TYPE=profiled PYTHONPATH="$WARPSCALE_SRC${PYTHONPATH:+:$PYTHONPATH}" \
-        "${SRUN[@]}" "$WARPSCALE_BIN" run --experiment "$EXPERIMENT" --run-name "nanochat-$MODE" -- \
+        "$WARPSCALE_BIN" run --experiment "$EXPERIMENT" --run-name "nanochat-$MODE" -- \
         "${TORCHRUN[@]}" "${TRAIN_ARGS[@]}"
 fi
