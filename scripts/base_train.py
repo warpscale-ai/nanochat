@@ -375,7 +375,7 @@ if has_warpscale:
         total_steps=num_iterations,
         tokens_per_step=total_batch_size,
         precision=warpscale_precision,
-        framework="nanochat",
+        framework="ddp",
         param_count=num_params,
         flops_per_token=num_flops_per_token,
         start_step=args.resume_from_step if resuming else 0,
