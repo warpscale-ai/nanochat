@@ -200,6 +200,77 @@ class _Float8Matmul(torch.autograd.Function):
         return grad_input, grad_weight, None, None
 
 
+@torch._dynamo.allow_in_graph
+class _ReluSquareFloat8Matmul(torch.autograd.Function):
+    """relu(x).square() followed by an FP8 GEMM, sharing one saved tensor.
+
+    The GEMM's quantized input is relu(x) squared, and relu(x) is non-negative, so
+    its square root recovers relu(x) for the activation's own gradient. Saving that
+    one FP8 tensor therefore replaces both it and the bf16 relu a separate
+    activation would have to keep.
+    """
+
+    @staticmethod
+    def forward(ctx, input_2d, weight, weight_fp8=None, weight_inv=None):
+        act = torch.relu(input_2d).square()
+        act_fp8, act_inv = _to_fp8(act, torch.float8_e4m3fn)
+        if weight_fp8 is None:
+            weight_fp8, weight_inv = _to_fp8(weight, torch.float8_e4m3fn)
+        ctx.save_for_backward(act_fp8, act_inv, weight_fp8, weight_inv)
+        ctx.input_dtype = input_2d.dtype
+        return torch._scaled_mm(
+            act_fp8,
+            weight_fp8.t(),
+            scale_a=act_inv,
+            scale_b=weight_inv,
+            out_dtype=input_2d.dtype,
+            use_fast_accum=True,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        act_fp8, act_inv, w_fp8, w_inv = ctx.saved_tensors
+
+        go_fp8, go_inv = _to_fp8(grad_output, torch.float8_e5m2)
+        grad_act = torch._scaled_mm(
+            go_fp8,
+            _to_col_major(w_fp8),
+            scale_a=go_inv,
+            scale_b=w_inv,
+            out_dtype=grad_output.dtype,
+            use_fast_accum=False,
+        )
+        grad_weight = torch._scaled_mm(
+            go_fp8.t().contiguous(),
+            _to_col_major(act_fp8),
+            scale_a=go_inv,
+            scale_b=act_inv,
+            out_dtype=grad_output.dtype,
+            use_fast_accum=False,
+        )
+
+        # d/dx relu(x)^2 = 2*relu(x), and relu(x) = sqrt(relu(x)^2). Negative x lands
+        # on relu(x) = 0, so the zero gradient there falls out rather than needing a mask.
+        act = act_fp8.to(torch.float32) * act_inv
+        grad_input = grad_act * (2.0 * act.sqrt()).to(grad_act.dtype)
+        return grad_input.to(ctx.input_dtype), grad_weight, None, None
+
+
+def relu_square_linear(x, linear):
+    """relu(x).square() then `linear`, fused when `linear` does FP8 compute."""
+    if not isinstance(linear, Float8Linear):
+        return linear(torch.relu(x).square())
+    x = x.to(COMPUTE_DTYPE)
+    orig_shape = x.shape
+    output = _ReluSquareFloat8Matmul.apply(
+        x.reshape(-1, orig_shape[-1]), linear.weight, linear.w_fp8, linear.w_inv_scale
+    )
+    output = output.reshape(*orig_shape[:-1], output.shape[-1])
+    if linear.bias is not None:
+        output = output + linear.bias.to(output.dtype)
+    return output
+
+
 class Float8Linear(nn.Linear):
     """Drop-in nn.Linear replacement that does FP8 compute.
 

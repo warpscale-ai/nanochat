@@ -23,6 +23,7 @@ from contextlib import contextmanager
 
 import wandb
 import torch
+import torch._functorch.config  # activation_memory_budget is not reachable via plain `import torch`
 import torch.distributed as dist
 
 try:
@@ -54,6 +55,9 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
+# Activation memory
+parser.add_argument("--activation-memory-budget", type=float, default=1.0, help="fraction of the compiled region's default saved activations to keep; below 1.0 the partitioner recomputes the cheapest ops needed to fit (1.0 = off)")
+parser.add_argument("--activation-memory-estimator", type=str, default="flops", choices=["flops", "profile", "testing"], help="how the budget solver prices a recompute; 'profile' benchmarks each op instead of counting FLOPs")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -254,6 +258,14 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
+if not 0.0 < args.activation_memory_budget <= 1.0:
+    parser.error(f"--activation-memory-budget must be in (0, 1], got {args.activation_memory_budget}")
+if args.activation_memory_budget < 1.0:
+    # The min-cut partitioner optimises runtime and only recomputes cheap pointwise ops. Under a
+    # budget it instead solves a knapsack for the fastest recompute set that fits the ceiling.
+    torch._functorch.config.activation_memory_budget = args.activation_memory_budget
+    torch._functorch.config.activation_memory_budget_runtime_estimator = args.activation_memory_estimator
+    print0(f"Activation memory budget: {args.activation_memory_budget} (runtime estimator: {args.activation_memory_estimator})")
 model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
